@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Gym Coach Skill</title>
+</head>
+<body>
+<script>
+/**
+ * Gym Coach Skill — scripts/index.html
+ * Runs inside Edge Gallery's sandboxed WebView.
+ *
+ * Tools exposed:
+ *   log_workout(date, exercises, notes, mood, input_type)
+ *   get_workout_history(days)
+ *   analyze_media(description)
+ */
+
+const LOG_FILE = "gym-log.md";
+const STATS_FILE = "gym-stats.json";
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function today() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm   = String(d.getMonth() + 1).padStart(2, "0");
+  const dd   = String(d.getDate()).padStart(2, "0");
+  const days = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+  return {
+    iso:     `${yyyy}-${mm}-${dd}`,
+    display: `${days[d.getDay()]}, ${dd}/${mm}/${yyyy}`
+  };
+}
+
+function parseDayEntry(text) {
+  // Extracts session type, mood, running data from a log entry block
+  const lines = text.split("\n");
+  const entry = { type: "Unknown", mood: 3, hasRun: false, hasCore: false, muscles: [] };
+
+  for (const line of lines) {
+    if (line.includes("**Session Type:**")) {
+      const t = line.split("**Session Type:**")[1].trim();
+      entry.type = t;
+      if (t.includes("Upper")) entry.muscles.push("upper");
+      if (t.includes("Lower")) entry.muscles.push("lower");
+      if (t.includes("Full"))  entry.muscles.push("upper","lower");
+      if (t.includes("Core"))  entry.hasCore = true;
+      if (t.includes("Running")) entry.hasRun = true;
+    }
+    if (line.includes("**Mood:**")) {
+      const m = line.match(/Mood:\*\* (\d)/);
+      if (m) entry.mood = parseInt(m[1]);
+    }
+    if (line.toLowerCase().includes("distance:")) entry.hasRun = true;
+    if (line.toLowerCase().includes("plank") || line.toLowerCase().includes("crunch") ||
+        line.toLowerCase().includes("leg raise") || line.toLowerCase().includes("core")) {
+      entry.hasCore = true;
+    }
+  }
+  return entry;
+}
+
+function analyzeHistory(logText, days) {
+  // Split log into per-day entries and return last N days
+  const entries = logText.split(/^## \d{4}-\d{2}-\d{2}/m).filter(e => e.trim());
+  const dateHeaders = [...logText.matchAll(/^## (\d{4}-\d{2}-\d{2})/gm)];
+
+  const recentEntries = [];
+  const cutoff = days || 7;
+
+  for (let i = 0; i < Math.min(entries.length, cutoff); i++) {
+    const date = dateHeaders[i] ? dateHeaders[i][1] : "unknown";
+    const parsed = parseDayEntry(entries[i]);
+    recentEntries.push({ date, ...parsed, raw: entries[i] });
+  }
+
+  return recentEntries;
+}
+
+// ─── Tool: log_workout ───────────────────────────────────────────────────────
+
+async function log_workout(params) {
+  const { date, exercises, notes, mood, session_type, duration, running } = params;
+  const dateInfo = today();
+  const logDate = date || dateInfo.iso;
+  const displayDate = dateInfo.display;
+
+  // Build the markdown entry
+  let moodLabel = ["","exhausted","tired","average","strong","great"][mood] || "average";
+  
+  let exerciseTable = "| Exercise | Sets | Reps/Duration | Notes |\n|---|---|---|---|\n";
+  if (Array.isArray(exercises)) {
+    for (const ex of exercises) {
+      const exNotes = ex.notes || ex.weight || "-";
+      exerciseTable += `| ${ex.name || "Unknown"} | ${ex.sets || "-"} | ${ex.reps || ex.duration || "-"} | ${exNotes} |\n`;
+    }
+  } else {
+    exerciseTable += `| ${exercises || "General workout"} | - | - | - |\n`;
+  }
+
+  let runningSection = "";
+  if (running && (running.distance || running.time)) {
+    runningSection = `\n### Running:\n- Distance: ${running.distance || "?"} km\n- Time: ${running.time || "?"}\n- Pace: ${running.pace || "?"} /km\n- Feel: ${running.feel || "moderate"}\n`;
+  }
+
+  const coachNote = mood >= 4
+    ? "Great energy today — push the intensity another 5% next session."
+    : mood <= 2
+    ? "Low energy noted. Recovery and sleep are part of the program too."
+    : "Solid session. Consistency is the key — show up again tomorrow.";
+
+  const entry = `\n## ${logDate} — ${displayDate}\n**Session Type:** ${session_type || "General"}\n**Duration:** ${duration || "?"} minutes\n**Mood:** ${mood || 3} — ${moodLabel}\n\n### Exercises:\n${exerciseTable}${runningSection}\n### Coach Notes:\n${coachNote}\n\n---\n`;
+
+  try {
+    // Read existing log, prepend new entry at top (latest first)
+    let existingLog = "";
+    try {
+      const existing = await SandboxFS.readFile(LOG_FILE);
+      existingLog = existing || "";
+    } catch (e) {
+      // First entry — file doesn't exist yet
+      existingLog = `# 🏋️ Gym Log\n*Goals: Faster running · Abs · Toned body*\n\n`;
+    }
+
+    // Check if today's entry already exists; if so, append/update
+    if (existingLog.includes(`## ${logDate}`)) {
+      // Append additional set to today's entry
+      const updatedLog = existingLog.replace(
+        `## ${logDate}`,
+        `## ${logDate} [UPDATED]`
+      ) + `\n### Additional Session — ${new Date().toLocaleTimeString()}:\n${exerciseTable}`;
+      await SandboxFS.writeFile(LOG_FILE, updatedLog);
+    } else {
+      // Prepend new day entry after the header
+      const headerEnd = existingLog.indexOf("\n\n") + 2;
+      const header = existingLog.substring(0, headerEnd);
+      const rest   = existingLog.substring(headerEnd);
+      await SandboxFS.writeFile(LOG_FILE, header + entry + rest);
+    }
+
+    // Update stats JSON
+    let stats = { totalSessions: 0, totalRunningDays: 0, streak: 0, lastLogDate: "" };
+    try {
+      const statsRaw = await SandboxFS.readFile(STATS_FILE);
+      if (statsRaw) stats = JSON.parse(statsRaw);
+    } catch (e) { /* first run */ }
+
+    stats.totalSessions++;
+    if (running && running.distance) stats.totalRunningDays++;
+    stats.lastLogDate = logDate;
+
+    // Streak calculation
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayISO = yesterday.toISOString().split("T")[0];
+    if (stats.lastLogDate === yesterdayISO || stats.streak === 0) {
+      stats.streak++;
+    } else if (stats.lastLogDate !== logDate) {
+      stats.streak = 1;
+    }
+
+    await SandboxFS.writeFile(STATS_FILE, JSON.stringify(stats, null, 2));
+
+    return JSON.stringify({
+      result: {
+        message: `✅ Workout logged for ${displayDate}`,
+        streak: stats.streak,
+        totalSessions: stats.totalSessions,
+        coachNote
+      }
+    });
+
+  } catch (err) {
+    return JSON.stringify({ error: `Failed to save workout: ${err.message}` });
+  }
+}
+
+// ─── Tool: get_workout_history ───────────────────────────────────────────────
+
+async function get_workout_history(params) {
+  const days = params.days || 7;
+
+  try {
+    let logText = "";
+    try {
+      logText = await SandboxFS.readFile(LOG_FILE);
+    } catch (e) {
+      return JSON.stringify({
+        result: {
+          message: "No workout history found yet. Log your first session!",
+          history: [],
+          stats: { totalSessions: 0, streak: 0 }
+        }
+      });
+    }
+
+    if (!logText || logText.trim().length < 50) {
+      return JSON.stringify({
+        result: {
+          message: "Workout log is empty. Start logging to get personalized plans!",
+          history: [],
+          stats: { totalSessions: 0, streak: 0 }
+        }
+      });
+    }
+
+    const entries = analyzeHistory(logText, days);
+
+    let stats = { totalSessions: 0, streak: 0 };
+    try {
+      const statsRaw = await SandboxFS.readFile(STATS_FILE);
+      if (statsRaw) stats = JSON.parse(statsRaw);
+    } catch (e) { /* no stats yet */ }
+
+    // Compute what's been trained in the last 48h
+    const now = new Date();
+    const recentMuscles = [];
+    let runDaysThisWeek = 0;
+    let coreDaysThisWeek = 0;
+
+    for (const entry of entries) {
+      const entryDate = new Date(entry.date);
+      const diffHours = (now - entryDate) / 36e5;
+      if (diffHours <= 48) recentMuscles.push(...(entry.muscles || []));
+      if (entry.hasRun) runDaysThisWeek++;
+      if (entry.hasCore) coreDaysThisWeek++;
+    }
+
+    return JSON.stringify({
+      result: {
+        recentEntries: entries.map(e => ({
+          date: e.date,
+          type: e.type,
+          mood: e.mood,
+          hasRun: e.hasRun,
+          hasCore: e.hasCore,
+          muscles: e.muscles
+        })),
+        analysis: {
+          recentMuscleGroups: [...new Set(recentMuscles)],
+          runDaysThisWeek,
+          coreDaysThisWeek,
+          needsRun: runDaysThisWeek < 2,
+          needsCore: coreDaysThisWeek < 3,
+          lastEntryDate: entries[0]?.date || "none"
+        },
+        stats,
+        rawLog: logText.substring(0, 3000) // pass recent raw for LLM context
+      }
+    });
+
+  } catch (err) {
+    return JSON.stringify({ error: `Failed to read history: ${err.message}` });
+  }
+}
+
+// ─── Tool: analyze_media ────────────────────────────────────────────────────
+
+async function analyze_media(params) {
+  // This tool is a passthrough — Gemma 4 E2B handles the actual
+  // multimodal analysis natively. This function returns structured
+  // context so the LLM knows what to focus on.
+  const { description, media_type } = params;
+
+  const focusAreas = {
+    "form_photo": [
+      "Check spine alignment and posture",
+      "Verify joint angles (knees, elbows, hips)",
+      "Look for muscle engagement indicators",
+      "Identify any compensation patterns"
+    ],
+    "progress_photo": [
+      "Note visible muscle definition in abs/core",
+      "Assess overall body composition change",
+      "Compare upper/lower body proportion",
+      "Identify areas showing most improvement"
+    ],
+    "equipment_photo": [
+      "Identify the equipment type",
+      "Suggest 3–5 exercises suited to user goals (running / abs / tone)",
+      "Note proper setup and safety tips"
+    ],
+    "video": [
+      "Assess rep quality and range of motion",
+      "Check tempo (too fast = momentum, not muscle)",
+      "Look for fatigue compensation in later reps",
+      "Suggest 2–3 specific form cues"
+    ]
+  };
+
+  const focus = focusAreas[media_type] || focusAreas["form_photo"];
+
+  return JSON.stringify({
+    result: {
+      mediaType: media_type || "photo",
+      description: description || "User shared media",
+      analysisGuide: focus,
+      userGoals: ["faster running", "abs", "toned body"],
+      instruction: "Analyze the media with these focus areas in mind, then give specific, actionable feedback tied to the user's goals."
+    }
+  });
+}
+
+// ─── Main Entry Point ────────────────────────────────────────────────────────
+
+window.ai_edge_gallery_get_result = async function(data) {
+  try {
+    const params = JSON.parse(data);
+    const tool = params.tool || params.function || params.action;
+
+    if (!tool) {
+      return JSON.stringify({ error: "No tool specified. Use: log_workout, get_workout_history, or analyze_media" });
+    }
+
+    switch (tool) {
+      case "log_workout":
+        return await log_workout(params);
+
+      case "get_workout_history":
+        return await get_workout_history(params);
+
+      case "analyze_media":
+        return await analyze_media(params);
+
+      default:
+        return JSON.stringify({ error: `Unknown tool: "${tool}". Available: log_workout, get_workout_history, analyze_media` });
+    }
+
+  } catch (err) {
+    return JSON.stringify({
+      error: `Gym Coach skill error: ${err.message}`,
+      stack: err.stack
+    });
+  }
+};
+</script>
+</body>
+</html>
